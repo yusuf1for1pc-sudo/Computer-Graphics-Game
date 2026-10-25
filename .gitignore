@@ -1,0 +1,5 @@
+# Build output: the playable build is shipped in release/ as a zip
+/GeometryDash.exe
+/GeometryDash_new.exe
+/*.dll
+*.o
