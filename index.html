@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Geometry Dash-style runner from our Computer Graphics mini project: 8 stages, jump pads, orbs, double jump, slam and falling needles.">
+<title>Geometry Dash Clone</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bungee&family=Chakra+Petch:wght@500;700&display=swap">
+<style>
+  /* Layout: one full-window canvas, letterboxed to 16:9. Single dark arcade look. */
+  :root {
+    --void: #07031a;      /* letterbox and page background */
+    --ink: #f2eeff;       /* loading text */
+    --display: "Bungee", "Arial Black", Impact, sans-serif;
+    --ui: "Chakra Petch", "Segoe UI", Tahoma, sans-serif;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--void); color: var(--ink); overflow: hidden;
+    padding-left: max(0px, env(safe-area-inset-left, 0px));
+    padding-right: max(0px, env(safe-area-inset-right, 0px));
+    padding-block: 0;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  #stage { width: 100%; height: 100%; display: grid; place-items: center; }
+  canvas { display: block; outline: none; }
+  canvas:focus-visible { outline: 2px solid #8be22b; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="game" tabindex="0" aria-label="Geometry Dash Clone. Press Space or tap to jump."></canvas>
+</div>
+
+<script>
+// Geometry Dash Clone - browser port of the C++ / OpenGL version.
+// Same physics, level generator (same seed), patterns, themes and controls.
+// Drawing uses Canvas 2D with a y-up world transform so the maths matches
+// the OpenGL version: world is 960 x 540, origin bottom-left.
+
+// ---------------------------------------------------------------- constants
+const WORLD_W = 960, WORLD_H = 540;
+const TILE = 40, GROUND_Y = 120, PLAYER_SIZE = 40, PLAYER_SCREEN_X = 220;
+const GRAVITY = 2800, JUMP_V = 820, DOUBLE_JUMP_V = 740, SLAM_V = -1500;
+const PAD_V = 1150, ORB_V = 820, ORB_R = 34;
+const NEEDLE_START = 600, NEEDLE_G = 2600, NEEDLE_LEAD = 0.62;
+const SPIN = 310, STEP = 1 / 120, PLAYER_INSET = 5, SPIKE_INSET = 8;
+const STAGES = 8, STAGE_SECONDS = 15, DOUBLE_JUMP_STAGE = 2, SLAM_STAGE = 4, LEVEL_ROWS = 6;
+const stageSpeed = k => 400 + 40 * k;
+
+const THEMES = [
+  ["Neon Purple", [0.34,0.13,0.95],[0.29,0.09,0.84],[0.16,0.06,0.78],[0.08,0.02,0.43],[0.35,0.17,0.88]],
+  ["Deep Blue",   [0.10,0.38,0.95],[0.07,0.30,0.82],[0.05,0.22,0.72],[0.02,0.08,0.40],[0.20,0.50,0.98]],
+  ["Jungle",      [0.12,0.68,0.35],[0.08,0.56,0.28],[0.05,0.44,0.22],[0.02,0.20,0.10],[0.25,0.88,0.45]],
+  ["Ocean",       [0.05,0.62,0.72],[0.03,0.50,0.60],[0.02,0.38,0.50],[0.01,0.16,0.24],[0.20,0.85,0.92]],
+  ["Lava",        [0.86,0.14,0.20],[0.72,0.09,0.15],[0.55,0.05,0.10],[0.25,0.02,0.05],[1.00,0.40,0.30]],
+  ["Sunset",      [0.96,0.52,0.10],[0.86,0.40,0.06],[0.70,0.28,0.04],[0.35,0.12,0.02],[1.00,0.75,0.30]],
+  ["Candy",       [0.90,0.22,0.65],[0.78,0.15,0.55],[0.60,0.10,0.45],[0.28,0.04,0.22],[1.00,0.55,0.85]],
+  ["Midnight",    [0.12,0.10,0.20],[0.20,0.17,0.30],[0.16,0.13,0.26],[0.05,0.04,0.09],[0.95,0.78,0.25]],
+].map(([name, bg, panel, groundTop, groundBottom, grid]) => ({name, bg, panel, groundTop, groundBottom, grid}));
+
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const mixTheme = (a, b, t) => ({name: b.name, bg: mix(a.bg, b.bg, t), panel: mix(a.panel, b.panel, t),
+  groundTop: mix(a.groundTop, b.groundTop, t), groundBottom: mix(a.groundBottom, b.groundBottom, t), grid: mix(a.grid, b.grid, t)});
+const rgba = (c, a = 1) => `rgba(${Math.round(c[0] * 255)},${Math.round(c[1] * 255)},${Math.round(c[2] * 255)},${a})`;
+
+// Patterns: columns bottom to top. '#' block '^' spike 'v' hanging needle
+// 'p' pad 'o' orb '!' falling needle. Same table as main.cpp.
+const PATTERNS = [
+  [0, 2, ["^"]], [0, 3, ["^", "^"]], [0, 2, ["#"]], [0, 4, ["#", "", "", "^"]],
+  [1, 7, ["^", "^", "^"]], [1, 4, ["#", "#", "#"]], [1, 5, ["#", "#", "##", "##"]],
+  [1, 7, ["p", "", "", "^..#", "^..#", "^..#", "^..#"]],
+  [1, 6, ["p", "^", "^", "^", "^", "^", "^", "^"]],
+  [1, 6, ["#", "#", "#^", "#", "#"]],
+  [2, 7, ["", "", "", "####", "####"]],
+  [2, 7, ["^", "^", "^", "^", "^", "^", "^", "^"]],
+  [2, 7, ["", "", "", "####", "####", "^", "^", "^"]],
+  [2, 7, ["^", "^", "^.#", "^.#", "^", "^", "^", "^..#", "^..#", "^", "^", "^"]],
+  [3, 7, ["^", "^", "^", "^..o", "^", "^", "^", "^", "^"]],
+  [3, 7, ["^", "^", "^", "^..o", "^", "^", "^", "^", "^..o", "^", "^", "^", "^"]],
+  [3, 4, ["", "..o", "", "#####", "#####"]],
+  [4, 7, ["...v#", "...v#", "...v#", "^..v#", "...v#", "...v#", "...v#"]],
+  [4, 7, ["^", "^", "^", "^", "", "", "^", "^", "^", "^"]],
+  [4, 7, ["...v#", "...v#", "^..v#", "...v#", "...v#", "...v#", "^..v#", "...v#", "...v#"]],
+  [5, 7, ["", "", "!", "", ""]],
+  [5, 7, ["!", "", "", "!", "", "", "!"]],
+  [5, 7, ["^", "^", "!", "^", "^"]],
+  [5, 7, ["", "", "", "####", "", "", "", "", "####"]],
+  [6, 7, ["^", "^", "", "#", "#^", "#", "", "^", "^", "^"]],
+  [6, 7, ["p", "", "", "", ".v#", ".v#", ".v#", ".v#", ".v#"]],
+].map(([minStage, maxStage, cols]) => ({minStage, maxStage, cols}));
+
+// -------------------------------------------------------------------- state
+const level = Array.from({length: LEVEL_ROWS}, () => []);
+let levelCols = 0;
+const stageStartCol = new Array(STAGES + 1).fill(0);
+const player = {x: 0, y: GROUND_Y, vy: 0, angle: 0, onGround: true, usedDouble: false};
+let particles = [];
+let state = "MENU", paused = false;
+let jumpHeld = false, jumpPressed = false, slamPressed = false;
+let attempts = 1, currentStage = 0, bestStage = 0;
+let deathTimer = 0, bannerTimer = 0, bannerTitle = "", bannerText = "";
+let cameraX = 0, accumulator = 0, elapsed = 0, lastTime = 0, trailCounter = 0;
+
+try { bestStage = Number(localStorage.getItem("gd-best")) || 0; } catch (e) {}
+function saveBest() { try { localStorage.setItem("gd-best", String(bestStage)); } catch (e) {} }
+
+const frand = (a, b) => a + (b - a) * Math.random();
+const tileAt = (c, h) => (c < 0 || c >= levelCols || h < 0 || h >= LEVEL_ROWS) ? "." : level[h][c];
+const tileX = c => c * TILE;
+const tileY = h => GROUND_Y + h * TILE;
+function stageAtX(x) { for (let k = STAGES - 1; k >= 0; k--) if (x >= stageStartCol[k] * TILE) return k; return 0; }
+const doubleJumpUnlocked = () => currentStage >= DOUBLE_JUMP_STAGE;
+const slamUnlocked = () => currentStage >= SLAM_STAGE;
+
+// ------------------------------------------------- level from patterns (seeded)
+let rngState = 2026;
+function rng(n) { rngState = (Math.imul(rngState, 1664525) + 1013904223) >>> 0; return (rngState >>> 16) % n; }
+function addColumn(col) {
+  for (let h = 0; h < LEVEL_ROWS; h++) level[h].push(h < col.length && col[h] !== "." ? col[h] : ".");
+  levelCols++;
+}
+function buildLevel() {
+  rngState = 2026;
+  for (const r of level) r.length = 0;
+  levelCols = 0;
+  for (let k = 0; k < STAGES; k++) {
+    stageStartCol[k] = levelCols;
+    const stageCols = Math.round(STAGE_SECONDS * stageSpeed(k) / TILE);
+    const tail = Math.ceil(stageSpeed(k) * 2 * JUMP_V / GRAVITY / TILE) + 1;
+    let used = 0, last = -1;
+    for (let i = 0; i < 12; i++) { addColumn(""); used++; }
+    let fresh = [];
+    PATTERNS.forEach((p, i) => { if (p.minStage === k) fresh.push(i); });
+    let count = 0;
+    while (true) {
+      const pool = [];
+      PATTERNS.forEach((p, i) => {
+        if (k < p.minStage || k > p.maxStage || i === last) return;
+        const w = p.minStage === k ? 5 : p.minStage === k - 1 ? 2 : 1;
+        for (let j = 0; j < w; j++) pool.push(i);
+      });
+      last = pool[rng(pool.length)];
+      if (count % 2 === 1 && fresh.length) {
+        const i = rng(fresh.length);
+        if (fresh[i] !== last || fresh.length === 1) last = fresh[i];
+      }
+      fresh = fresh.filter(f => f !== last);
+      count++;
+      const pat = PATTERNS[last];
+      const lead = Math.max(4, 9 - k) + rng(4) + (rng(5) === 0 ? 6 : 0);
+      const len = lead + pat.cols.length + tail;
+      if (used + len > stageCols) break;
+      for (let i = 0; i < lead; i++) addColumn("");
+      for (const c of pat.cols) addColumn(c);
+      for (let i = 0; i < tail; i++) addColumn("");
+      used += len;
+    }
+    while (used < stageCols) { addColumn(""); used++; }
+  }
+  stageStartCol[STAGES] = levelCols;
+}
+
+// ------------------------------------------------------------------ canvas
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let scale = 1, offX = 0, offY = 0, cssW = 0, cssH = 0;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  cssW = canvas.parentElement.clientWidth; cssH = canvas.parentElement.clientHeight;
+  canvas.style.width = cssW + "px"; canvas.style.height = cssH + "px";
+  canvas.width = Math.round(cssW * dpr); canvas.height = Math.round(cssH * dpr);
+  scale = Math.min(canvas.width / WORLD_W, canvas.height / WORLD_H);
+  offX = (canvas.width - WORLD_W * scale) / 2; offY = (canvas.height - WORLD_H * scale) / 2;
+}
+window.addEventListener("resize", resize);
+
+// STEP 1: viewport + orthographic projection. Flip y so world y points up.
+function setWorldTransform() { ctx.setTransform(scale, 0, 0, -scale, offX, offY + WORLD_H * scale); }
+
+// screen pixel -> world (the inverse of the viewport mapping)
+function toWorld(clientX, clientY) {
+  const r = canvas.getBoundingClientRect(), dpr = canvas.width / r.width;
+  const px = (clientX - r.left) * dpr, py = (clientY - r.top) * dpr;
+  return {x: (px - offX) / scale, y: WORLD_H - (py - offY) / scale};
+}
+
+// ---------------------------------------------------- STEP 7a scan conversion
+function plot(x, y, s) { ctx.fillRect(x - s / 2, y - s / 2, s, s); }
+function bresenhamLine(x0, y0, x1, y1, s = 1) {
+  x0 |= 0; y0 |= 0; x1 |= 0; y1 |= 0;
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy;
+  while (true) {
+    plot(x0, y0, s);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+function midpointCircle(xc, yc, r, s = 1.5) {
+  r |= 0; let x = 0, y = r, p = 1 - r;
+  while (x <= y) {
+    for (const [a, b] of [[x, y], [y, x], [-x, y], [-y, x], [x, -y], [y, -x], [-x, -y], [-y, -x]]) plot(xc + a, yc + b, s);
+    x++;
+    if (p < 0) p += 2 * x + 1; else { y--; p += 2 * (x - y) + 1; }
+  }
+}
+
+// ----------------------------------------------------- STEP 2 output primitives
+function rect(x, y, w, h) { ctx.fillRect(x, y, w, h); }
+function disc(cx, cy, r) { ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill(); }
+function tri(ax, ay, bx, by, cx, cy) { ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.lineTo(cx, cy); ctx.closePath(); }
+
+const CUBE_LAYERS = [[0, "#07031a"], [0.05, "#8be22b"], [0.217, "#07031a"], [0.258, "#6b3be8"], [0.367, "#07031a"], [0.4, "#2fe6f2"]];
+function drawCube(x, y, s) {
+  for (const [inset, col] of CUBE_LAYERS) { const i = inset * s; ctx.fillStyle = col; rect(x + i, y + i, s - 2 * i, s - 2 * i); }
+}
+
+function drawBlock(x, y, th) {
+  ctx.strokeStyle = "rgba(217,200,255,0.08)";
+  for (let i = 4; i >= 1; i--) { ctx.lineWidth = i * 3; ctx.strokeRect(x, y, TILE, TILE); }
+  const g = ctx.createLinearGradient(0, y, 0, y + TILE);
+  g.addColorStop(0, rgba(mix(th.groundBottom, [0, 0, 0], 0.2))); g.addColorStop(1, "#05020f");
+  ctx.fillStyle = g; rect(x, y, TILE, TILE);
+  ctx.strokeStyle = rgba(th.grid); ctx.lineWidth = 1.5; ctx.beginPath();
+  for (let i = 1; i < 3; i++) {
+    ctx.moveTo(x + i * TILE / 3, y + 2); ctx.lineTo(x + i * TILE / 3, y + TILE - 2);
+    ctx.moveTo(x + 2, y + i * TILE / 3); ctx.lineTo(x + TILE - 2, y + i * TILE / 3);
+  }
+  ctx.stroke();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.strokeRect(x, y, TILE, TILE);
+}
+
+// spike pulses by scaling about the centre of its base (translate-scale-translate)
+function drawSpike(x, y) {
+  const pulse = 1 + 0.06 * Math.sin(elapsed * 6), bx = x + TILE / 2;
+  ctx.save();
+  ctx.translate(bx, y); ctx.scale(1, pulse); ctx.translate(-bx, -y);
+  const g = ctx.createLinearGradient(0, y, 0, y + TILE);
+  g.addColorStop(0, "rgba(184,242,214,0.3)"); g.addColorStop(1, "#fff");
+  tri(x, y, x + TILE, y, x + TILE / 2, y + TILE);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.restore();
+}
+// reflection about the tile's horizontal centre line
+function drawHangingNeedle(x, y) {
+  const cy = y + TILE / 2;
+  ctx.save(); ctx.translate(0, cy); ctx.scale(1, -1); ctx.translate(0, -cy);
+  drawSpike(x, y); ctx.restore();
+}
+function drawFallingNeedle(x, y) {
+  const g = ctx.createLinearGradient(0, y + 4, 0, y + 46);
+  g.addColorStop(0, "#fff"); g.addColorStop(1, "rgba(255,90,90,0.5)");
+  tri(x + 10, y + 46, x + 30, y + 46, x + 20, y + 4);
+  ctx.fillStyle = g; ctx.fill(); ctx.strokeStyle = "#ffe6e6"; ctx.lineWidth = 1.5; ctx.stroke();
+}
+function drawPad(x, y) {
+  const cx = x + TILE / 2;
+  ctx.fillStyle = `rgba(255,217,51,${0.25 + 0.15 * Math.sin(elapsed * 8)})`; rect(x + 6, y, TILE - 12, 26);
+  ctx.beginPath(); ctx.ellipse(cx, y, 17, 9, 0, 0, Math.PI); ctx.fillStyle = "#ffc21a"; ctx.fill();
+}
+function drawOrb(x, y) {
+  const cx = x + TILE / 2, cy = y + TILE / 2, pulse = 1 + 0.12 * Math.sin(elapsed * 7);
+  ctx.fillStyle = "rgba(255,217,38,0.9)"; disc(cx, cy, 11);
+  ctx.fillStyle = "rgba(255,242,153,0.9)"; midpointCircle(cx, cy, 17 * pulse);
+  ctx.fillStyle = "rgba(255,242,153,0.35)"; midpointCircle(cx, cy, 24 * pulse);
+}
+
+// text in a y-up world: flip back locally so glyphs read the right way up
+function text(str, x, y, size, color, align = "left", font = "var(--ui)", weight = 700) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(1, -1);
+  ctx.font = `${weight} ${size}px ${font === "display" ? '"Bungee", "Arial Black", sans-serif' : '"Chakra Petch", "Segoe UI", sans-serif'}`;
+  ctx.textAlign = align; ctx.textBaseline = "alphabetic"; ctx.fillStyle = color;
+  ctx.fillText(str, 0, 0); ctx.restore();
+}
+
+// ------------------------------------------------------------ STEP 7b particles
+function spawnTrail() {
+  const life = frand(0.25, 0.45);
+  particles.push({x: player.x + frand(-2, 6), y: player.y + frand(2, 12), vx: frand(-30, 0), vy: frand(10, 50),
+    life, maxLife: life, size: frand(3, 7), c: [0.85, 0.82, 0.97], gravity: false});
+}
+function spawnBurst(cx, cy, n, minSp, maxSp, a, b, gravity) {
+  for (let i = 0; i < n; i++) {
+    const ang = frand(0, Math.PI * 2), sp = frand(minSp, maxSp), life = frand(0.4, 0.9);
+    particles.push({x: cx, y: cy, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, life, maxLife: life,
+      size: frand(4, 10), c: i % 2 ? a : b, gravity});
+  }
+}
+function updateParticles(dt) {
+  for (const p of particles) { if (p.gravity) p.vy -= 900 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+}
+function drawParticles() {
+  for (const p of particles) {
+    const t = p.life / p.maxLife, s = p.size * (0.4 + 0.6 * t);
+    ctx.fillStyle = rgba(p.c, t); rect(p.x - s / 2, p.y - s / 2, s, s);
+  }
+}
+
+// ------------------------------------------------------------ STEP 6 collision
+const boxOverlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+const cross = (a, b, c) => (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+function pointInTriangle(p, t) {
+  const d1 = cross(t[0], t[1], p), d2 = cross(t[1], t[2], p), d3 = cross(t[2], t[0], p);
+  return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
+}
+function segmentsCross(p1, p2, p3, p4) {
+  const d1 = cross(p3, p4, p1), d2 = cross(p3, p4, p2), d3 = cross(p1, p2, p3), d4 = cross(p1, p2, p4);
+  return ((d1 > 0) !== (d2 > 0)) && ((d3 > 0) !== (d4 > 0));
+}
+function boxHitsTriangle(b, t) {
+  for (const v of t) if (v.x >= b.x && v.x <= b.x + b.w && v.y >= b.y && v.y <= b.y + b.h) return true;
+  const c = [{x: b.x, y: b.y}, {x: b.x + b.w, y: b.y}, {x: b.x + b.w, y: b.y + b.h}, {x: b.x, y: b.y + b.h}];
+  for (const p of c) if (pointInTriangle(p, t)) return true;
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 3; j++) if (segmentsCross(c[i], c[(i + 1) % 4], t[j], t[(j + 1) % 3])) return true;
+  return false;
+}
+
+// ----------------------------------------------------------- STEP 3 game logic
+function showBanner(stage) {
+  bannerTitle = `STAGE ${stage + 1}`;
+  const msgs = {0: "Jump over the spikes!", 1: "NEW: JUMP PADS - yellow pads launch you high",
+    2: "NEW: DOUBLE JUMP - press jump again in the air", 3: "NEW: JUMP ORBS - press jump while touching a ring",
+    4: "NEW: SLAM - low ceilings: jump, then press DOWN", 5: "NEW: FALLING NEEDLES - watch for the red !"};
+  bannerText = msgs[stage] || `${THEMES[stage].name}  -  speed x${(stageSpeed(stage) / stageSpeed(0)).toFixed(1)}`;
+  bannerTimer = 2.5;
+}
+function spawnAtStage(stage) {
+  currentStage = stage;
+  Object.assign(player, {x: (stageStartCol[stage] + 1) * TILE, y: GROUND_Y, vy: 0, angle: 0, onGround: true, usedDouble: false});
+  jumpPressed = slamPressed = false; state = "PLAYING"; paused = false;
+  showBanner(stage);
+}
+function startRun() { attempts = 1; particles = []; spawnAtStage(0); }
+function goHome() { state = "MENU"; paused = false; jumpHeld = false; particles = []; }
+function killPlayer() {
+  spawnBurst(player.x + PLAYER_SIZE / 2, player.y + PLAYER_SIZE / 2, 40, 100, 500, [0.55, 0.89, 0.17], [0.18, 0.9, 0.95], true);
+  state = "DEAD"; deathTimer = 1;
+}
+function needleY(col, h) {
+  const speed = stageSpeed(currentStage), trigger = tileX(col) - NEEDLE_LEAD * speed;
+  if (player.x < trigger) return NEEDLE_START;
+  const t = (player.x - trigger) / speed;
+  return Math.max(tileY(h), NEEDLE_START - 0.5 * NEEDLE_G * t * t);
+}
+function touchingOrb() {
+  const c0 = Math.floor(player.x / TILE) - 1;
+  for (let c = c0; c < c0 + 4; c++) for (let h = 0; h < LEVEL_ROWS; h++) {
+    if (tileAt(c, h) !== "o") continue;
+    const dx = player.x + PLAYER_SIZE / 2 - (tileX(c) + TILE / 2), dy = player.y + PLAYER_SIZE / 2 - (tileY(h) + TILE / 2);
+    if (dx * dx + dy * dy <= ORB_R * ORB_R) return true;
+  }
+  return false;
+}
+
+function physicsStep() {
+  const speed = stageSpeed(currentStage), prevY = player.y;
+  player.x += speed * STEP;
+  if (jumpPressed) {
+    if (player.onGround) { player.vy = JUMP_V; player.onGround = false; }
+    else if (touchingOrb()) {
+      player.vy = ORB_V;
+      spawnBurst(player.x + 20, player.y + 20, 12, 80, 200, [1, 0.88, 0.2], [1, 1, 1], false);
+    } else if (doubleJumpUnlocked() && !player.usedDouble) {
+      player.vy = DOUBLE_JUMP_V; player.usedDouble = true;
+      spawnBurst(player.x + 20, player.y, 14, 80, 220, [0.18, 0.9, 0.95], [1, 1, 1], false);
+    }
+  }
+  if (jumpHeld && player.onGround) { player.vy = JUMP_V; player.onGround = false; }
+  if (slamPressed && slamUnlocked() && !player.onGround && player.vy > SLAM_V) {
+    player.vy = SLAM_V;
+    spawnBurst(player.x + 20, player.y + 40, 10, 60, 160, [1, 0.85, 0.3], [1, 1, 1], false);
+  }
+  jumpPressed = slamPressed = false;
+
+  player.vy -= GRAVITY * STEP; player.y += player.vy * STEP; player.onGround = false;
+  if (player.y <= GROUND_Y) { player.y = GROUND_Y; player.vy = 0; player.onGround = true; }
+
+  const c0 = Math.floor(player.x / TILE) - 1;
+  const hit = {x: player.x + PLAYER_INSET, y: player.y + PLAYER_INSET, w: PLAYER_SIZE - 2 * PLAYER_INSET, h: PLAYER_SIZE - 2 * PLAYER_INSET};
+  let onPad = false;
+  for (let c = c0; c < c0 + 4; c++) for (let h = 0; h < LEVEL_ROWS; h++) {
+    const t = tileAt(c, h), bx = tileX(c), by = tileY(h);
+    if (t === "v") {
+      if (boxHitsTriangle(hit, [{x: bx + SPIKE_INSET, y: by + TILE}, {x: bx + TILE - SPIKE_INSET, y: by + TILE}, {x: bx + TILE / 2, y: by + SPIKE_INSET * 1.5}])) return killPlayer();
+    } else if (t === "!") {
+      const ny = needleY(c, h);
+      if (boxHitsTriangle(hit, [{x: bx + 12, y: ny + 40}, {x: bx + 28, y: ny + 40}, {x: bx + 20, y: ny + 8}])) return killPlayer();
+    } else if (t === "p") {
+      if (boxOverlap({x: player.x, y: player.y, w: PLAYER_SIZE, h: PLAYER_SIZE}, {x: bx + 4, y: by, w: TILE - 8, h: 10})) onPad = true;
+    } else if (t === "#") {
+      if (!boxOverlap({x: player.x, y: player.y, w: PLAYER_SIZE, h: PLAYER_SIZE}, {x: bx, y: by, w: TILE, h: TILE})) continue;
+      if (prevY >= by + TILE - 1 && player.vy <= 0) { player.y = by + TILE; player.vy = 0; player.onGround = true; }
+      else return killPlayer();
+    } else if (t === "^") {
+      if (boxHitsTriangle(hit, [{x: bx + SPIKE_INSET, y: by}, {x: bx + TILE - SPIKE_INSET, y: by}, {x: bx + TILE / 2, y: by + TILE - SPIKE_INSET * 1.5}])) return killPlayer();
+    }
+  }
+  if (onPad) {
+    player.vy = PAD_V; player.onGround = false;
+    spawnBurst(player.x + 20, player.y, 10, 60, 180, [1, 0.88, 0.2], [1, 0.6, 0.9], false);
+  }
+  if (player.onGround) player.usedDouble = false;
+  if (player.onGround) player.angle = Math.round(player.angle / 90) * 90; else player.angle -= SPIN * STEP;
+  if (player.onGround && ++trailCounter % 3 === 0) spawnTrail();
+
+  const s = stageAtX(player.x);
+  if (s !== currentStage) {
+    currentStage = s;
+    if (currentStage > bestStage) { bestStage = currentStage; saveBest(); }
+    showBanner(currentStage);
+  }
+  if (player.x >= levelCols * TILE) {
+    state = "WIN"; bestStage = STAGES; saveBest();
+    spawnBurst(PLAYER_SCREEN_X + cameraX, 300, 80, 150, 600, [1, 0.85, 0.2], [0.55, 0.89, 0.17], true);
+  }
+}
+
+function update(dt) {
+  elapsed += dt;
+  if (bannerTimer > 0) bannerTimer -= dt;
+  if (state === "PLAYING" && !paused) physicsStep();
+  if (state === "DEAD") { deathTimer -= dt; if (deathTimer <= 0) { attempts++; spawnAtStage(currentStage); } }
+  if (!paused) updateParticles(dt);
+}
+
+// ------------------------------------------------------------------ drawing
+function currentTheme() {
+  if (state === "MENU") {
+    const t = elapsed / 3, k = Math.floor(t) % STAGES;
+    return mixTheme(THEMES[k], THEMES[(k + 1) % STAGES], Math.min(1, (t - Math.floor(t)) * 3));
+  }
+  const k = currentStage;
+  if (k === 0) return THEMES[0];
+  const into = (player.x - stageStartCol[k] * TILE) / (stageSpeed(k) * 1.5);
+  return mixTheme(THEMES[k - 1], THEMES[k], Math.min(1, Math.max(0, into)));
+}
+
+const PANELS = [[-10,375,80,165],[90,490,305,50],[90,247,225,225],[334,337,62,65],[334,255,62,62],[414,337,237,203],
+  [336,157,315,165],[669,370,165,165],[857,375,115,165],[-10,104,77,165],[89,75,225,75],[669,190,97,97],
+  [797,190,100,97],[669,75,235,82],[921,104,50,165]];
+// STEP 7c: parallax. Odd stages rotate every panel 45 degrees about its own centre.
+function drawBackground(th, diamonds) {
+  const offset = -((cameraX * 0.25) % WORLD_W);
+  ctx.fillStyle = rgba(th.panel);
+  for (let k = 0; k < 2; k++) {
+    ctx.save(); ctx.translate(offset + k * WORLD_W, 0);
+    for (const [x, y, w, h] of PANELS) {
+      if (!diamonds) { rect(x, y, w, h); continue; }
+      const s = Math.min(w, h) * 0.75;
+      ctx.save(); ctx.translate(x + w / 2, y + h / 2); ctx.rotate(Math.PI / 4); rect(-s / 2, -s / 2, s, s); ctx.restore();
+    }
+    ctx.restore();
+  }
+}
+function drawGround(th) {
+  const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+  g.addColorStop(0, rgba(th.groundBottom)); g.addColorStop(1, rgba(th.groundTop));
+  ctx.fillStyle = g; rect(0, 0, WORLD_W, GROUND_Y);
+  ctx.fillStyle = rgba(mix(th.groundBottom, [0, 0, 0], 0.4), 0.8);
+  const seam = 216;
+  for (let x = -(cameraX % seam); x < WORLD_W; x += seam) bresenhamLine(x, 0, x, GROUND_Y - 8, 1.2);
+  ctx.fillStyle = "rgba(242,235,255,0.05)";
+  for (let i = 6; i >= 1; i--) rect(0, GROUND_Y - i * 1.5, WORLD_W, i * 3);
+  ctx.fillStyle = "#f2edff"; bresenhamLine(0, GROUND_Y, WORLD_W, GROUND_Y, 1.4);
+}
+function drawLevel(th) {
+  const first = Math.floor(cameraX / TILE) - 1, last = first + WORLD_W / TILE + 3;
+  for (let c = first; c <= last; c++) for (let h = 0; h < LEVEL_ROWS; h++) {
+    const t = tileAt(c, h), x = tileX(c), y = tileY(h);
+    if (t === "#") drawBlock(x, y, th);
+    else if (t === "^") drawSpike(x, y);
+    else if (t === "v") drawHangingNeedle(x, y);
+    else if (t === "p") drawPad(x, y);
+    else if (t === "o") drawOrb(x, y);
+    else if (t === "!") {
+      const ny = needleY(c, h);
+      drawFallingNeedle(x, ny);
+      const trigger = x - NEEDLE_LEAD * stageSpeed(currentStage);
+      if (ny >= NEEDLE_START && player.x > trigger - 300) text("!", x + TILE / 2, 420, 40, "#ff4040", "center", "display");
+    }
+  }
+  for (let k = 1; k <= STAGES; k++) {
+    const fx = stageStartCol[k] * TILE;
+    if (fx < cameraX - 10 || fx > cameraX + WORLD_W + 10) continue;
+    ctx.strokeStyle = k === STAGES ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.35)";
+    ctx.lineWidth = k === STAGES ? 5 : 2;
+    ctx.beginPath(); ctx.moveTo(fx, GROUND_Y); ctx.lineTo(fx, WORLD_H); ctx.stroke();
+  }
+}
+// STEP 4: rotation about the cube's centre, M = T(c) R(angle) T(-c)
+function drawPlayerAt(x, y, angle) {
+  const cx = x + PLAYER_SIZE / 2, cy = y + PLAYER_SIZE / 2;
+  ctx.save();
+  ctx.translate(cx, cy); ctx.rotate(angle * Math.PI / 180); ctx.translate(-cx, -cy);
+  drawCube(x, y, PLAYER_SIZE);
+  ctx.restore();
+}
+
+// --------------------------------------------------------------- STEP 8 HUD
+const HOME = {x: 18, y: 488, s: 36}, PAUSE = {x: 925, y: 505, r: 20}, PLAY = {x: 480, y: 235, r: 62};
+function drawHomeButton() {
+  ctx.fillStyle = "rgba(0,0,0,0.25)"; rect(HOME.x, HOME.y, HOME.s, HOME.s);
+  ctx.strokeStyle = "rgba(242,235,255,0.8)"; ctx.lineWidth = 2; ctx.strokeRect(HOME.x, HOME.y, HOME.s, HOME.s);
+  const cx = HOME.x + HOME.s / 2;
+  ctx.fillStyle = "rgba(242,235,255,0.85)";
+  tri(cx - 12, HOME.y + 19, cx + 12, HOME.y + 19, cx, HOME.y + 30); ctx.fill();
+  rect(cx - 8, HOME.y + 7, 16, 12);
+  ctx.fillStyle = "rgba(26,13,64,0.9)"; rect(cx - 3, HOME.y + 7, 6, 7);
+}
+function drawPauseButton() {
+  ctx.fillStyle = "rgba(242,235,255,0.75)";
+  midpointCircle(PAUSE.x, PAUSE.y, PAUSE.r);
+  rect(PAUSE.x - 8, PAUSE.y - 9, 5, 18); rect(PAUSE.x + 3, PAUSE.y - 9, 5, 18);
+}
+function drawAbility(x, y, name, unlocked, hint) {
+  ctx.fillStyle = "rgba(0,0,0,0.25)"; rect(x, y, 160, 22);
+  text(unlocked ? name : `${name} ${hint}`, x + 7, y + 6, 12, unlocked ? "#8be22b" : "rgba(255,255,255,0.5)");
+}
+function drawHUD() {
+  const startX = stageStartCol[0] * TILE, endX = levelCols * TILE;
+  const progress = Math.min(1, Math.max(0, (player.x - startX) / (endX - startX)));
+  const bx = 330, by = 508, bw = 300, bh = 10;
+  ctx.fillStyle = "rgba(0,0,0,0.35)"; rect(bx, by, bw, bh);
+  ctx.fillStyle = "#8be22b"; rect(bx + 1.5, by + 1.5, (bw - 3) * progress, bh - 3);
+  ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 1.5; ctx.strokeRect(bx, by, bw, bh);
+  ctx.beginPath();
+  for (let k = 1; k < STAGES; k++) {
+    const tx = bx + bw * (stageStartCol[k] - stageStartCol[0]) / (levelCols - stageStartCol[0]);
+    ctx.moveTo(tx, by); ctx.lineTo(tx, by + bh);
+  }
+  ctx.stroke();
+  text(`${Math.floor(progress * 100)}%`, bx + bw + 12, by, 16, "#fff");
+  const inStage = (player.x - stageStartCol[currentStage] * TILE) / stageSpeed(currentStage);
+  const secs = Math.floor(currentStage * STAGE_SECONDS + Math.min(inStage, STAGE_SECONDS));
+  text(`STAGE ${currentStage + 1}/${STAGES}   ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")} / 2:00`, bx, by - 24, 12, "#fff", "left", "ui", 500);
+  drawAbility(64, 500, "DOUBLE JUMP", doubleJumpUnlocked(), "(stage 3)");
+  drawAbility(64, 472, "DOWN SLAM", slamUnlocked(), "(stage 5)");
+  drawHomeButton(); drawPauseButton();
+
+  if (bannerTimer > 0 && state !== "WIN") {
+    const a = Math.min(1, bannerTimer / 0.6);
+    text(bannerTitle, WORLD_W / 2, 360, 52, `rgba(255,255,255,${a})`, "center", "display", 400);
+    text(bannerText, WORLD_W / 2, 325, 18, `rgba(255,255,191,${a})`, "center");
+  }
+  if (paused) {
+    ctx.fillStyle = "rgba(0,0,0,0.45)"; rect(0, 0, WORLD_W, WORLD_H);
+    text("PAUSED", WORLD_W / 2, 285, 48, "#fff", "center", "display", 400);
+    text("Press P or tap the pause button to continue", WORLD_W / 2, 245, 18, "#fff", "center");
+  }
+  if (state === "WIN") {
+    ctx.fillStyle = "rgba(0,0,0,0.5)"; rect(0, 0, WORLD_W, WORLD_H);
+    text("YOU BEAT ALL 8 STAGES!", WORLD_W / 2, 310, 40, "#ffd933", "center", "display", 400);
+    text(`Attempts: ${attempts}`, WORLD_W / 2, 265, 18, "#fff", "center");
+    text("Click, tap or press Space to go home", WORLD_W / 2, 235, 18, "#fff", "center");
+  }
+}
+
+function drawMenu(th) {
+  const pulse = 1 + 0.04 * Math.sin(elapsed * 4);
+  ctx.save();
+  ctx.translate(WORLD_W / 2, 430); ctx.rotate(2 * Math.sin(elapsed * 1.5) * Math.PI / 180); ctx.translate(-WORLD_W / 2, -430);
+  text("GEOMETRY DASH", WORLD_W / 2 + 4, 416, 62, "rgba(0,0,0,0.35)", "center", "display", 400);
+  text("GEOMETRY DASH", WORLD_W / 2, 420, 62, "#fff", "center", "display", 400);
+  ctx.restore();
+  text("CLONE  -  C++ / OPENGL  ->  WEB", WORLD_W / 2, 378, 18, rgba(mix(th.grid, [1, 1, 1], 0.5)), "center");
+
+  ctx.save();
+  ctx.translate(PLAY.x, PLAY.y); ctx.scale(pulse, pulse); ctx.translate(-PLAY.x, -PLAY.y);
+  ctx.fillStyle = "#07031a"; disc(PLAY.x, PLAY.y, PLAY.r + 6);
+  ctx.fillStyle = "#8be22b"; disc(PLAY.x, PLAY.y, PLAY.r);
+  ctx.fillStyle = "#07031a"; tri(PLAY.x - 18, PLAY.y - 28, PLAY.x - 18, PLAY.y + 28, PLAY.x + 30, PLAY.y); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = "rgba(255,255,255,0.8)"; midpointCircle(PLAY.x, PLAY.y, PLAY.r * pulse + 14);
+
+  text("Click PLAY, tap, or press SPACE to start", WORLD_W / 2, 140, 18, "#fff", "center");
+  const small = (s, y) => text(s, 40, y, 12, "rgba(255,255,255,0.85)", "left", "ui", 500);
+  small(bestStage >= STAGES ? "Best: all 8 stages cleared!" : `Best: stage ${bestStage + 1} of 8`, 92);
+  small("Jump: Space / Up / Click / Tap     Double jump: jump again in the air (stage 3+)", 72);
+  small("Slam: Down / S / swipe down (stage 5+)     Pause: P     Restart stage: R     Home: H", 52);
+  small("Orbs: press jump while touching a ring     Practice: press 1-8 to start at that stage", 32);
+
+  const t = (elapsed % 0.8) / 0.8, hop = 4 * 90 * t * (1 - t);
+  drawPlayerAt(700, GROUND_Y + hop, -180 * t);
+}
+
+function render() {
+  const th = currentTheme();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "#07031a"; ctx.fillRect(0, 0, canvas.width, canvas.height);   // letterbox
+  setWorldTransform();
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, WORLD_W, WORLD_H); ctx.clip();
+  ctx.fillStyle = rgba(th.bg); rect(0, 0, WORLD_W, WORLD_H);
+
+  if (state === "MENU") cameraX = elapsed * 120;
+  else if (state !== "DEAD") cameraX = player.x - PLAYER_SCREEN_X;
+  const k = state === "MENU" ? Math.floor(elapsed / 3) % STAGES : currentStage;
+  drawBackground(th, k % 2 === 1);
+  drawGround(th);
+
+  if (state === "MENU") { drawMenu(th); ctx.restore(); return; }
+
+  ctx.save(); ctx.translate(-cameraX, 0);           // STEP 5: camera is a translation
+  drawLevel(th);
+  text(`Attempt ${attempts}`, (stageStartCol[currentStage] + 3) * TILE, 430, 24, "rgba(255,255,255,0.75)", "left", "ui", 500);
+  drawParticles();
+  if (state !== "DEAD") drawPlayerAt(player.x, player.y, player.angle);
+  ctx.restore();
+  drawHUD();
+  ctx.restore();
+}
+
+function frame(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+  accumulator += dt;
+  while (accumulator >= STEP) { update(STEP); accumulator -= STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+
+// -------------------------------------------------------------------- input
+function pressJump() {
+  if (state === "MENU") { startRun(); return; }
+  if (state === "WIN") { goHome(); return; }
+  jumpHeld = true; jumpPressed = true;
+}
+window.addEventListener("keydown", e => {
+  const k = e.key;
+  if ([" ", "ArrowUp", "ArrowDown"].includes(k)) e.preventDefault();
+  if (e.repeat) return;
+  if (k === " " || k === "ArrowUp" || k === "w" || k === "W") pressJump();
+  if (k === "Enter" && state === "MENU") startRun();
+  if (k >= "1" && k <= "8" && state === "MENU") { startRun(); spawnAtStage(Number(k) - 1); }
+  if ((k === "ArrowDown" || k === "s" || k === "S") && state === "PLAYING") slamPressed = true;
+  if ((k === "p" || k === "P") && state === "PLAYING") paused = !paused;
+  if ((k === "r" || k === "R") && (state === "PLAYING" || state === "DEAD")) { attempts++; spawnAtStage(currentStage); }
+  if (k === "h" || k === "H" || k === "Escape") goHome();
+});
+window.addEventListener("keyup", e => {
+  if (e.key === " " || e.key === "ArrowUp" || e.key === "w" || e.key === "W") jumpHeld = false;
+});
+
+let pointerStartY = null, slammedThisTouch = false;
+canvas.addEventListener("pointerdown", e => {
+  canvas.focus();
+  pointerStartY = e.clientY; slammedThisTouch = false;
+  const p = toWorld(e.clientX, e.clientY);
+  if (state === "MENU") {
+    const dx = p.x - PLAY.x, dy = p.y - PLAY.y;
+    if (dx * dx + dy * dy <= (PLAY.r + 14) ** 2 || e.pointerType !== "mouse") startRun();
+    return;
+  }
+  if (p.x >= HOME.x && p.x <= HOME.x + HOME.s && p.y >= HOME.y && p.y <= HOME.y + HOME.s) { goHome(); return; }
+  const dx = p.x - PAUSE.x, dy = p.y - PAUSE.y;
+  if (dx * dx + dy * dy <= PAUSE.r * PAUSE.r * 1.5) { if (state === "PLAYING") paused = !paused; return; }
+  pressJump();
+});
+canvas.addEventListener("pointermove", e => {
+  if (pointerStartY === null || slammedThisTouch) return;
+  if (e.clientY - pointerStartY > 40 && state === "PLAYING") { slamPressed = true; slammedThisTouch = true; jumpHeld = false; }
+});
+const endPointer = () => { pointerStartY = null; jumpHeld = false; };
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+
+// --------------------------------------------------------------------- boot
+buildLevel();
+resize();
+canvas.focus();
+lastTime = performance.now();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
